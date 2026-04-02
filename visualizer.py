@@ -1,511 +1,530 @@
 """
-Viser 3D Visualization for Leap Motion Arpeggiator
+ModernGL + ImGui visualization for Leap Motion Arpeggiator.
 
 Renders:
-    - A semi-transparent 3×3×3 chord selection cube (right hand zone)
-  - Spheres for palm positions of both hands
-  - Small spheres for fingertips
-  - Labels showing chord names in each zone
-  - Active zone highlighting
-  - GUI sidebar with real-time musical parameters
-  - A "note trail" showing recently played notes
+    - A semi-transparent 3x3x3 chord selection cube (right hand zone)
+    - Spheres for palm positions of both hands
+    - Small spheres for fingertips
+    - Chord name overlays projected from 3D zone centers
+    - Active zone highlighting
+    - ImGui sidebar with real-time musical parameters
+    - A "note trail" showing recently played notes
 """
 
-import time
 import math
 import numpy as np
+import glm
+import moderngl
+import moderngl_window
+import imgui
+from imgui.integrations.pyglet import PygletProgrammablePipelineRenderer
 
-import viser
-
+from shaders import MESH_VERTEX, MESH_FRAGMENT, LINE_VERTEX, LINE_FRAGMENT
+from geometry import make_cube, make_sphere, make_grid, make_wire_cube
 from shared_state import (
     SharedState, CHORD_GRID, CHORD_COLORS,
     midi_to_name, chord_name_from_root,
 )
 
 
-class ArpeggiatorVisualizer:
-    """
-    Creates and maintains the viser 3D scene.
-    Reads from SharedState and updates scene objects each frame.
-    """
+class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
+    gl_version = (3, 3)
+    title = "Leap Arpeggiator"
+    window_size = (1400, 900)
+    resizable = True
+    vsync = True
 
-    # Cube dimensions in scene units (we scale Leap mm → scene units)
-    CUBE_SIZE = 3.0        # total cube edge length
-    ZONE_SIZE = 1.0        # each zone is 1×1×1 (3×3×3 = 3)
-    SCALE = 3.0 / 300.0   # 300mm Leap range → 3 scene units
-    Y_OFFSET = -2.5        # shift Leap Y=250 to scene center
+    _shared_state = None
 
-    def __init__(self, state: SharedState, port: int = 8080):
-        self.state = state
-        self.port = port
-        self.server = None
+    @classmethod
+    def run(cls, state: SharedState, port: int = 8080):
+        cls._shared_state = state
+        moderngl_window.run_window_config(cls, args=[])
 
-        # Scene handles (set during build)
-        self._zone_handles = {}     # (layer, row, col) → mesh handle
-        self._label_handles = {}    # (layer, row, col) → label handle
-        self._right_palm = None
-        self._left_palm = None
-        self._right_fingers = []
-        self._left_fingers = []
-        self._note_trail = []
-        self._hud_base_note = None
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
-        # GUI handles
-        self._gui_chord = None
-        self._gui_base_note = None
-        self._gui_steps = None
-        self._gui_spread = None
-        self._gui_bpm = None
-        self._gui_note_min = None
-        self._gui_note_max = None
-        self._gui_fps = None
-        self._gui_perf_mode = None
-        self._gui_show_fingers = None
-        self._gui_show_trail = None
-        self._gui_current_note = None
+        self.state = self.__class__._shared_state
 
-        # Active zone tracking for highlight
-        self._active_zone = (-1, -1, -1)
-        self._last_base_opacity = None
-        self._last_label_base_note = None
-        self._last_label_layer = None
-        self._last_gui_update_time = 0.0
-        self._gui_update_period = 0.1  # seconds
-        self._last_controls = None
-        self._last_show_fingers = None
-        self._last_show_trail = None
-        self._last_perf_mode = None
+        # ImGui setup
+        imgui.create_context()
+        self.imgui_renderer = PygletProgrammablePipelineRenderer(self.wnd._window)
 
-    def start(self):
-        """Build the viser server, scene, and GUI. Then loop forever updating."""
-        self.server = viser.ViserServer(port=self.port)
-        self.server.scene.set_up_direction("+y")
-
-        self._build_scene()
-        self._build_gui()
-
-        print(f"\n  ✦ Viser running at: http://localhost:{self.port}")
-        print(f"    Open this URL in your browser to see the 3D visualization.\n")
-
-        self._update_loop()
-
-    def _leap_to_scene(self, pos: np.ndarray) -> tuple:
-        """Convert Leap Motion mm coordinates to viser scene coordinates."""
-        x = pos[0] * self.SCALE
-        y = (pos[1] - 250) * self.SCALE  # center around Leap Y=250
-        z = pos[2] * self.SCALE
-        return (x, y, z)
-
-    def _build_scene(self):
-        """Create the static and dynamic scene objects."""
-        s = self.server
-
-        # ---- Grid floor ----
-        s.scene.add_grid(
-            "/grid",
-            width=8.0,
-            height=8.0,
-            position=(0.0, -2.0, 0.0),
+        # Compile shader programs
+        self.mesh_prog = self.ctx.program(
+            vertex_shader=MESH_VERTEX,
+            fragment_shader=MESH_FRAGMENT,
+        )
+        self.line_prog = self.ctx.program(
+            vertex_shader=LINE_VERTEX,
+            fragment_shader=LINE_FRAGMENT,
         )
 
-        # ---- Chord cube zones (3×3×3) ----
-        half = self.CUBE_SIZE / 2.0
-        zone = self.ZONE_SIZE
+        # Build geometry VAOs
+        self._build_vaos()
+
+        # Camera state (orbit camera)
+        self.cam_distance = 8.0
+        self.cam_yaw = math.radians(-30)
+        self.cam_pitch = math.radians(25)
+        self.cam_target = glm.vec3(0.0, 0.0, 0.0)
+
+        # GUI state
+        self.gui_bpm = 120
+        self.gui_note_min = 36
+        self.gui_note_max = 60
+        self.gui_perf_mode = True
+        self.gui_show_fingers = False
+        self.gui_show_trail = False
+        self.gui_zone_opacity = 0.08
+
+        # Note trail tracking
+        self._trail_positions = []  # list of (glm.vec3, color_tuple, age_counter)
+        self._last_step = -1
+        self._trail_max = 10
+
+        # OpenGL state
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+
+    def _build_vaos(self):
+        # Cube (mesh)
+        verts, norms, indices = make_cube()
+        buf = np.hstack([verts, norms]).astype("f4")
+        vbo = self.ctx.buffer(buf.tobytes())
+        ibo = self.ctx.buffer(indices.tobytes())
+        self.cube_vao = self.ctx.vertex_array(
+            self.mesh_prog,
+            [(vbo, "3f 3f", "in_position", "in_normal")],
+            index_buffer=ibo,
+        )
+
+        # Sphere (mesh)
+        verts, norms, indices = make_sphere(rings=12, sectors=24)
+        buf = np.hstack([verts, norms]).astype("f4")
+        vbo = self.ctx.buffer(buf.tobytes())
+        ibo = self.ctx.buffer(indices.tobytes())
+        self.sphere_vao = self.ctx.vertex_array(
+            self.mesh_prog,
+            [(vbo, "3f 3f", "in_position", "in_normal")],
+            index_buffer=ibo,
+        )
+
+        # Grid (lines)
+        grid_verts = make_grid(size=8.0, divisions=16)
+        vbo = self.ctx.buffer(grid_verts.tobytes())
+        self.grid_vao = self.ctx.vertex_array(
+            self.line_prog,
+            [(vbo, "3f", "in_position")],
+        )
+        self.grid_vertex_count = len(grid_verts)
+
+        # Wire cube (lines)
+        wire_verts = make_wire_cube()
+        vbo = self.ctx.buffer(wire_verts.tobytes())
+        self.wire_cube_vao = self.ctx.vertex_array(
+            self.line_prog,
+            [(vbo, "3f", "in_position")],
+        )
+        self.wire_cube_vertex_count = len(wire_verts)
+
+    def _eye_position(self):
+        yaw = self.cam_yaw
+        pitch = self.cam_pitch
+        eye = self.cam_target + self.cam_distance * glm.vec3(
+            math.cos(pitch) * math.sin(yaw),
+            math.sin(pitch),
+            math.cos(pitch) * math.cos(yaw),
+        )
+        return eye
+
+    def _view_matrix(self):
+        eye = self._eye_position()
+        return glm.lookAt(eye, self.cam_target, glm.vec3(0, 1, 0))
+
+    def _proj_matrix(self):
+        w, h = self.window_size
+        aspect = w / max(h, 1)
+        return glm.perspective(glm.radians(45.0), aspect, 0.1, 100.0)
+
+    def mouse_drag_event(self, x, y, dx, dy):
+        self.cam_yaw += dx * 0.003
+        self.cam_pitch = max(
+            math.radians(-89),
+            min(math.radians(89), self.cam_pitch + dy * 0.003),
+        )
+
+    def mouse_scroll_event(self, x_offset, y_offset):
+        self.cam_distance = max(2.0, min(30.0, self.cam_distance - y_offset * 0.5))
+
+    def _leap_to_scene(self, pos):
+        x = pos[0] * 3.0 / 300.0
+        y = (pos[1] - 250) * 3.0 / 300.0
+        z = pos[2] * 3.0 / 300.0
+        return glm.vec3(x, y, z)
+
+    def _draw_mesh(self, vao, model, color, opacity, view, proj, eye):
+        self.mesh_prog["u_model"].write(bytes(model))
+        self.mesh_prog["u_view"].write(bytes(view))
+        self.mesh_prog["u_proj"].write(bytes(proj))
+        self.mesh_prog["u_color"].value = tuple(color)
+        self.mesh_prog["u_opacity"].value = opacity
+        self.mesh_prog["u_light_dir"].value = (0.5, 1.0, 0.3)
+        self.mesh_prog["u_view_pos"].value = tuple(eye)
+        vao.render(moderngl.TRIANGLES)
+
+    def _draw_lines(self, vao, count, color, opacity, view, proj):
+        self.line_prog["u_view"].write(bytes(view))
+        self.line_prog["u_proj"].write(bytes(proj))
+        self.line_prog["u_color"].value = tuple(color)
+        self.line_prog["u_opacity"].value = opacity
+        vao.render(moderngl.LINES, vertices=count)
+
+    def _world_to_screen(self, world_pos, view, proj):
+        """Project a 3D world position to 2D screen coordinates.
+
+        Returns (sx, sy, is_visible).
+        """
+        pos4 = glm.vec4(world_pos, 1.0)
+        clip = proj * view * pos4
+        if clip.w <= 0.0:
+            return 0, 0, False
+        ndc = glm.vec3(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w)
+        if ndc.z < -1.0 or ndc.z > 1.0:
+            return 0, 0, False
+        w, h = self.window_size
+        sx = (ndc.x * 0.5 + 0.5) * w
+        sy = (1.0 - (ndc.y * 0.5 + 0.5)) * h
+        return sx, sy, True
+
+    def render(self, time_val, frametime):
+        self.ctx.clear(0.08, 0.08, 0.12, 1.0)
+
+        snap = self.state.read()
+
+        view = self._view_matrix()
+        proj = self._proj_matrix()
+        eye = self._eye_position()
+
+        # Draw grid floor at Y=-2.0
+        grid_view = glm.translate(view, glm.vec3(0.0, -2.0, 0.0))
+        self.line_prog["u_view"].write(bytes(grid_view))
+        self.line_prog["u_proj"].write(bytes(proj))
+        self.line_prog["u_color"].value = (0.3, 0.3, 0.35)
+        self.line_prog["u_opacity"].value = 0.4
+        self.grid_vao.render(moderngl.LINES, vertices=self.grid_vertex_count)
+
+        # Render chord cube
+        self._render_chord_cube(snap, view, proj, eye)
+
+        # Render hands
+        self._render_hands(snap, view, proj, eye)
+
+        # Render note trail
+        if self.gui_show_trail:
+            self._render_note_trail(snap, view, proj, eye)
+
+        # Sync GUI controls to shared state
+        self._sync_gui_to_state(snap)
+
+        # Render ImGui
+        self._render_imgui(snap, view, proj)
+
+    def _render_chord_cube(self, snap, view, proj, eye):
+        active_layer = snap.chord_zone_layer
+        active_row = snap.chord_zone_row
+        active_col = snap.chord_zone_col
+        base_opacity = self.gui_zone_opacity
+        perf_mode = self.gui_perf_mode
 
         for layer in range(3):
             for row in range(3):
                 for col in range(3):
-                    # Position: center of each zone cell
-                    cx = -half + zone * 0.5 + col * zone
-                    cy = -half + zone * 0.5 + layer * zone
-                    cz = -half + zone * 0.5 + row * zone
+                    cx = -1.5 + 0.5 + col * 1.0
+                    cy = -1.5 + 0.5 + layer * 1.0
+                    cz = -1.5 + 0.5 + row * 1.0
 
-                    color_rgb = CHORD_COLORS[layer][row][col]
-                    name = f"/cube/zone_{layer}_{row}_{col}"
+                    r, g, b = CHORD_COLORS[layer][row][col]
+                    color = glm.vec3(r / 255.0, g / 255.0, b / 255.0)
 
-                    handle = s.scene.add_box(
-                        name=name,
-                        dimensions=(zone * 0.92, zone * 0.92, zone * 0.92),
-                        color=color_rgb,
-                        position=(cx, cy, cz),
-                        opacity=0.12,
-                    )
-                    self._zone_handles[(layer, row, col)] = handle
+                    is_active = (layer == active_layer and row == active_row and col == active_col)
+                    same_layer = (layer == active_layer)
 
-                    # Label for each cube (dynamic text updated in loop)
-                    quality = CHORD_GRID[layer][row][col]
-                    chord_name = chord_name_from_root(60, quality)
-                    label_name = f"/cube/label_{layer}_{row}_{col}"
-                    label_handle = s.scene.add_label(
-                        label_name,
-                        text=chord_name,
-                        position=(cx, cy, cz),
-                    )
-                    self._label_handles[(layer, row, col)] = label_handle
-
-        self._hud_base_note = s.scene.add_label(
-            "/hud/base_note",
-            text="Base: C4",
-            position=(0.0, 2.2, 0.0),
-        )
-
-        # ---- Cube wireframe outline ----
-        # Draw edges of the overall cube
-        corners = []
-        for x in [-half, half]:
-            for y in [-0.2, 0.2]:
-                for z in [-half, half]:
-                    corners.append([x, y, z])
-
-        # ---- Hand palm spheres ----
-        self._right_palm = s.scene.add_icosphere(
-            "/hands/right_palm",
-            radius=0.15,
-            color=(255, 100, 60),
-            position=(0.5, 0, 0),
-        )
-
-        self._left_palm = s.scene.add_icosphere(
-            "/hands/left_palm",
-            radius=0.15,
-            color=(60, 140, 255),
-            position=(-0.5, 0, 0),
-        )
-
-        # ---- Fingertip spheres ----
-        for i in range(5):
-            rh = s.scene.add_icosphere(
-                f"/hands/right_finger_{i}",
-                radius=0.06,
-                color=(255, 160, 120),
-                position=(0.5, 0, 0),
-            )
-            self._right_fingers.append(rh)
-
-            lh = s.scene.add_icosphere(
-                f"/hands/left_finger_{i}",
-                radius=0.06,
-                color=(120, 170, 255),
-                position=(-0.5, 0, 0),
-            )
-            self._left_fingers.append(lh)
-
-        # ---- Note trail (small spheres showing recent arpeggio notes) ----
-        for i in range(10):
-            nh = s.scene.add_icosphere(
-                f"/notes/trail_{i}",
-                radius=0.04,
-                color=(255, 255, 100),
-                position=(0, -5, 0),  # hidden initially
-                opacity=0.0,
-            )
-            self._note_trail.append(nh)
-
-    def _build_gui(self):
-        """Create the sidebar GUI with musical parameter readouts."""
-        s = self.server
-
-        s.gui.add_markdown("## 🎵 Leap Arpeggiator")
-
-        with s.gui.add_folder("Musical State"):
-            self._gui_chord = s.gui.add_text(
-                "Chord",
-                initial_value="G7",
-                disabled=True,
-            )
-            self._gui_base_note = s.gui.add_text(
-                "Base Note",
-                initial_value="C4",
-                disabled=True,
-            )
-            self._gui_steps = s.gui.add_number(
-                "Steps",
-                initial_value=4,
-                disabled=True,
-            )
-            self._gui_spread = s.gui.add_number(
-                "Spread",
-                initial_value=1.0,
-                disabled=True,
-                step=0.01,
-            )
-            self._gui_current_note = s.gui.add_text(
-                "Playing",
-                initial_value="—",
-                disabled=True,
-            )
-
-        with s.gui.add_folder("Settings"):
-            self._gui_bpm = s.gui.add_slider(
-                "BPM",
-                min=40,
-                max=240,
-                step=1,
-                initial_value=120,
-            )
-            self._gui_fps = s.gui.add_slider(
-                "Visual FPS",
-                min=10,
-                max=30,
-                step=1,
-                initial_value=18,
-            )
-            self._gui_note_min = s.gui.add_slider(
-                "Note Min",
-                min=24,
-                max=84,
-                step=1,
-                initial_value=36,
-            )
-            self._gui_note_max = s.gui.add_slider(
-                "Note Max",
-                min=24,
-                max=84,
-                step=1,
-                initial_value=60,
-            )
-            self._gui_perf_mode = s.gui.add_checkbox(
-                "Performance Mode",
-                initial_value=True,
-            )
-            self._gui_show_fingers = s.gui.add_checkbox(
-                "Show Fingertips",
-                initial_value=False,
-            )
-            self._gui_show_trail = s.gui.add_checkbox(
-                "Show Note Trail",
-                initial_value=False,
-            )
-            self._gui_opacity = s.gui.add_slider(
-                "Zone Opacity",
-                min=0.05,
-                max=0.5,
-                step=0.01,
-                initial_value=0.08,
-            )
-
-        with s.gui.add_folder("Hand Tracking"):
-            self._gui_right_pos = s.gui.add_text(
-                "Right Palm",
-                initial_value="—",
-                disabled=True,
-            )
-            self._gui_left_pos = s.gui.add_text(
-                "Left Palm",
-                initial_value="—",
-                disabled=True,
-            )
-            self._gui_left_roll = s.gui.add_number(
-                "Left Roll°",
-                initial_value=0.0,
-                disabled=True,
-                step=0.1,
-            )
-            self._gui_left_pitch = s.gui.add_number(
-                "Left Pitch°",
-                initial_value=0.0,
-                disabled=True,
-                step=0.1,
-            )
-
-        s.gui.add_markdown(
-            "---\n"
-            "**Controls:**\n"
-            "- Right hand XYZ → chord zone\n"
-            "- Left hand height → base note\n"
-            "- Left hand roll → step count\n"
-            "- Left hand pitch → note spread"
-        )
-
-    def _update_loop(self):
-        """Main render loop — reads state and updates scene + GUI."""
-        note_trail_idx = 0
-        last_note = -1
-        last_step = -1
-
-        while True:
-            snap = self.state.read()
-            now = time.perf_counter()
-            gui_due = (now - self._last_gui_update_time) >= self._gui_update_period
-
-            # ---- Update BPM from GUI slider ----
-            note_min = int(self._gui_note_min.value)
-            note_max = int(self._gui_note_max.value)
-
-            if note_min >= note_max:
-                if note_min < 84:
-                    note_max = note_min + 1
-                    self._gui_note_max.value = note_max
-                else:
-                    note_min = 83
-                    note_max = 84
-                    self._gui_note_min.value = note_min
-                    self._gui_note_max.value = note_max
-
-            controls = (self._gui_bpm.value, note_min, note_max)
-            if controls != self._last_controls:
-                self.state.update(
-                    bpm=self._gui_bpm.value,
-                    note_min=note_min,
-                    note_max=note_max,
-                )
-                self._last_controls = controls
-
-            perf_mode = bool(self._gui_perf_mode.value)
-            show_fingers = bool(self._gui_show_fingers.value)
-            show_trail = bool(self._gui_show_trail.value)
-            perf_mode_changed = self._last_perf_mode is None or self._last_perf_mode != perf_mode
-
-            if self._last_show_fingers is None or self._last_show_fingers != show_fingers:
-                finger_opacity = 1.0 if show_fingers else 0.0
-                for fh in self._right_fingers:
-                    fh.opacity = finger_opacity
-                for fh in self._left_fingers:
-                    fh.opacity = finger_opacity
-                self._last_show_fingers = show_fingers
-
-            if self._last_show_trail is None or self._last_show_trail != show_trail:
-                trail_opacity = 0.6 if show_trail else 0.0
-                for nh in self._note_trail:
-                    nh.opacity = trail_opacity if show_trail else 0.0
-                self._last_show_trail = show_trail
-
-            # ---- Update zone highlighting ----
-            new_zone = (snap.chord_zone_layer, snap.chord_zone_row, snap.chord_zone_col)
-            base_opacity = self._gui_opacity.value
-            zone_changed = new_zone != self._active_zone
-            opacity_changed = self._last_base_opacity is None or abs(base_opacity - self._last_base_opacity) > 1e-6
-
-            if zone_changed:
-                # Dim old zone
-                if self._active_zone in self._zone_handles:
-                    old_h = self._zone_handles[self._active_zone]
-                    old_layer, old_row, old_col = self._active_zone
-                    old_h.opacity = base_opacity
-                    old_h.color = CHORD_COLORS[old_layer][old_row][old_col]
-
-                # Highlight new zone
-                if new_zone in self._zone_handles:
-                    new_h = self._zone_handles[new_zone]
-                    new_h.opacity = min(0.7, base_opacity * 3.0)
-                    # Brighten the color
-                    r, g, b = CHORD_COLORS[new_zone[0]][new_zone[1]][new_zone[2]]
-                    new_h.color = (
-                        min(255, r + 80),
-                        min(255, g + 80),
-                        min(255, b + 80),
-                    )
-
-                self._active_zone = new_zone
-
-            if zone_changed or opacity_changed or perf_mode_changed:
-                # Also update non-active zone opacities if active zone/layer or slider changed
-                for zone_key, handle in self._zone_handles.items():
-                    if zone_key == self._active_zone:
-                        continue
-                    if perf_mode:
-                        if zone_key[0] == new_zone[0]:
-                            handle.opacity = base_opacity * 0.55
+                    if is_active:
+                        opacity = min(0.7, base_opacity * 3.0)
+                        color = glm.vec3(
+                            min(1.0, color.x + 0.3),
+                            min(1.0, color.y + 0.3),
+                            min(1.0, color.z + 0.3),
+                        )
+                    elif perf_mode:
+                        if same_layer:
+                            opacity = base_opacity * 0.55
                         else:
-                            handle.opacity = 0.0
-                    elif zone_key[0] == new_zone[0]:
-                        handle.opacity = min(0.25, base_opacity * 1.35)
+                            opacity = 0.0
                     else:
-                        handle.opacity = base_opacity * 0.55
-                self._last_base_opacity = base_opacity
+                        if same_layer:
+                            opacity = min(0.25, base_opacity * 1.35)
+                        else:
+                            opacity = base_opacity * 0.55
 
-            # ---- Dynamic chord labels from current root note ----
-            labels_need_update = (
-                self._last_label_base_note != snap.base_note
-                or self._last_label_layer != new_zone[0]
-                or zone_changed
-                or perf_mode_changed
+                    if opacity < 0.005:
+                        continue
+
+                    model = glm.translate(glm.mat4(1.0), glm.vec3(cx, cy, cz))
+                    model = glm.scale(model, glm.vec3(0.92))
+
+                    self._draw_mesh(self.cube_vao, model, color, opacity, view, proj, eye)
+
+        # Draw outer wireframe cube scaled to 3.0
+        # Line shader has no u_model, so bake scale into view matrix
+        wire_view = view * glm.scale(glm.mat4(1.0), glm.vec3(3.0))
+        self._draw_lines(
+            self.wire_cube_vao, self.wire_cube_vertex_count,
+            (0.5, 0.5, 0.6), 0.3, wire_view, proj,
+        )
+
+    def _render_hands(self, snap, view, proj, eye):
+        rh = snap.right_hand
+        lh = snap.left_hand
+
+        if rh.visible:
+            rpos = self._leap_to_scene(rh.palm_position)
+            model = glm.translate(glm.mat4(1.0), rpos)
+            model = glm.scale(model, glm.vec3(0.15))
+            self._draw_mesh(
+                self.sphere_vao, model,
+                glm.vec3(1.0, 0.4, 0.24), 0.9,
+                view, proj, eye,
             )
 
-            if labels_need_update:
-                for (layer, row, col), label_handle in self._label_handles.items():
-                    quality = CHORD_GRID[layer][row][col]
-                    chord_label = chord_name_from_root(snap.base_note, quality)
-                    if (layer, row, col) == new_zone:
-                        label_handle.text = chord_label
-                    elif (not perf_mode) and layer == new_zone[0]:
-                        label_handle.text = chord_label
-                    else:
-                        label_handle.text = ""
-                self._last_label_base_note = snap.base_note
-                self._last_label_layer = new_zone[0]
-                self._last_perf_mode = perf_mode
+            if self.gui_show_fingers:
+                for i, fpos in enumerate(rh.finger_positions):
+                    fp = self._leap_to_scene(fpos)
+                    fmodel = glm.translate(glm.mat4(1.0), fp)
+                    fmodel = glm.scale(fmodel, glm.vec3(0.06))
+                    self._draw_mesh(
+                        self.sphere_vao, fmodel,
+                        glm.vec3(1.0, 0.63, 0.47), 0.85,
+                        view, proj, eye,
+                    )
 
-            # ---- Update hand positions ----
+        if lh.visible:
+            lpos = self._leap_to_scene(lh.palm_position)
+            model = glm.translate(glm.mat4(1.0), lpos)
+            model = glm.scale(model, glm.vec3(0.15))
+            self._draw_mesh(
+                self.sphere_vao, model,
+                glm.vec3(0.24, 0.55, 1.0), 0.9,
+                view, proj, eye,
+            )
+
+            if self.gui_show_fingers:
+                for i, fpos in enumerate(lh.finger_positions):
+                    fp = self._leap_to_scene(fpos)
+                    fmodel = glm.translate(glm.mat4(1.0), fp)
+                    fmodel = glm.scale(fmodel, glm.vec3(0.06))
+                    self._draw_mesh(
+                        self.sphere_vao, fmodel,
+                        glm.vec3(0.47, 0.67, 1.0), 0.85,
+                        view, proj, eye,
+                    )
+
+    def _render_note_trail(self, snap, view, proj, eye):
+        lh = snap.left_hand
+
+        # Detect step change and add new trail position
+        if snap.current_step != self._last_step:
+            self._last_step = snap.current_step
+            if lh.visible:
+                base_pos = self._leap_to_scene(lh.palm_position)
+                offset_x = (snap.current_step - snap.step_count / 2.0) * 0.12
+                trail_pos = glm.vec3(base_pos.x + offset_x, base_pos.y - 0.3, base_pos.z)
+                color_rgb = CHORD_COLORS[snap.chord_zone_layer][snap.chord_zone_row][snap.chord_zone_col]
+                color = glm.vec3(color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0)
+                self._trail_positions.append((trail_pos, color))
+                if len(self._trail_positions) > self._trail_max:
+                    self._trail_positions.pop(0)
+
+        # Render trail spheres with fading
+        total = len(self._trail_positions)
+        for i, (pos, color) in enumerate(self._trail_positions):
+            age = total - 1 - i  # 0 = newest
+            fade = max(0.0, 0.9 - age * 0.09)
+            if fade < 0.01:
+                continue
+            model = glm.translate(glm.mat4(1.0), pos)
+            model = glm.scale(model, glm.vec3(0.04))
+            self._draw_mesh(self.sphere_vao, model, color, fade, view, proj, eye)
+
+    def _sync_gui_to_state(self, snap):
+        note_min = self.gui_note_min
+        note_max = self.gui_note_max
+
+        if note_min >= note_max:
+            if note_min < 84:
+                note_max = note_min + 1
+                self.gui_note_max = note_max
+            else:
+                note_min = 83
+                note_max = 84
+                self.gui_note_min = note_min
+                self.gui_note_max = note_max
+
+        self.state.update(
+            bpm=float(self.gui_bpm),
+            note_min=note_min,
+            note_max=note_max,
+        )
+
+    def _render_imgui(self, snap, view, proj):
+        imgui.new_frame()
+
+        # --- Floating chord labels overlay ---
+        draw_list = imgui.get_background_draw_list()
+        active_layer = snap.chord_zone_layer
+        active_row = snap.chord_zone_row
+        active_col = snap.chord_zone_col
+        perf_mode = self.gui_perf_mode
+
+        for layer in range(3):
+            for row in range(3):
+                for col in range(3):
+                    is_active = (layer == active_layer and row == active_row and col == active_col)
+                    same_layer = (layer == active_layer)
+
+                    # In perf mode: show only same-layer labels
+                    # In non-perf mode: show active + same-layer labels
+                    if is_active:
+                        pass  # always show active
+                    elif same_layer:
+                        pass  # show same-layer labels
+                    else:
+                        continue  # hide other layers
+
+                    cx = -1.5 + 0.5 + col * 1.0
+                    cy = -1.5 + 0.5 + layer * 1.0
+                    cz = -1.5 + 0.5 + row * 1.0
+
+                    sx, sy, visible = self._world_to_screen(
+                        glm.vec3(cx, cy, cz), view, proj,
+                    )
+                    if not visible:
+                        continue
+
+                    quality = CHORD_GRID[layer][row][col]
+                    label = chord_name_from_root(snap.base_note, quality)
+
+                    if is_active:
+                        col_u32 = imgui.get_color_u32_rgba(1.0, 1.0, 1.0, 1.0)
+                    else:
+                        col_u32 = imgui.get_color_u32_rgba(0.8, 0.8, 0.8, 0.6)
+
+                    draw_list.add_text(sx - 10, sy - 6, col_u32, label)
+
+        # HUD label above cube: "Base: C4"
+        base_label = f"Base: {midi_to_name(snap.base_note)}"
+        hud_sx, hud_sy, hud_vis = self._world_to_screen(
+            glm.vec3(0.0, 2.2, 0.0), view, proj,
+        )
+        if hud_vis:
+            hud_col = imgui.get_color_u32_rgba(1.0, 1.0, 0.7, 0.9)
+            draw_list.add_text(hud_sx - 20, hud_sy - 8, hud_col, base_label)
+
+        # --- Main ImGui sidebar panel ---
+        imgui.set_next_window_position(10, 10, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(300, 700, imgui.FIRST_USE_EVER)
+        imgui.begin("Leap Arpeggiator")
+
+        # Musical State section
+        expanded, _ = imgui.collapsing_header(
+            "Musical State", flags=imgui.TREE_NODE_DEFAULT_OPEN,
+        )
+        if expanded:
+            imgui.text(f"Chord: {snap.chord_type}")
+            imgui.text(f"Base Note: {midi_to_name(snap.base_note)}")
+            imgui.text(f"Steps: {snap.step_count}")
+            imgui.text(f"Spread: {snap.note_spread:.2f}")
+            imgui.text(f"Playing: {midi_to_name(snap.current_note)}")
+            imgui.separator()
+
+        # Settings section
+        expanded, _ = imgui.collapsing_header(
+            "Settings", flags=imgui.TREE_NODE_DEFAULT_OPEN,
+        )
+        if expanded:
+            changed, val = imgui.slider_int("BPM", self.gui_bpm, 40, 240)
+            if changed:
+                self.gui_bpm = val
+
+            changed, val = imgui.slider_int("Note Min", self.gui_note_min, 24, 84)
+            if changed:
+                self.gui_note_min = val
+
+            changed, val = imgui.slider_int("Note Max", self.gui_note_max, 24, 84)
+            if changed:
+                self.gui_note_max = val
+
+            changed, val = imgui.slider_float(
+                "Zone Opacity", self.gui_zone_opacity, 0.05, 0.5,
+            )
+            if changed:
+                self.gui_zone_opacity = val
+
+            changed, val = imgui.checkbox("Performance Mode", self.gui_perf_mode)
+            if changed:
+                self.gui_perf_mode = val
+
+            changed, val = imgui.checkbox("Show Fingertips", self.gui_show_fingers)
+            if changed:
+                self.gui_show_fingers = val
+
+            changed, val = imgui.checkbox("Show Note Trail", self.gui_show_trail)
+            if changed:
+                self.gui_show_trail = val
+
+            imgui.separator()
+
+        # Hand Tracking section
+        expanded, _ = imgui.collapsing_header(
+            "Hand Tracking", flags=imgui.TREE_NODE_DEFAULT_OPEN,
+        )
+        if expanded:
             rh = snap.right_hand
             lh = snap.left_hand
-
             if rh.visible:
-                rpos = self._leap_to_scene(rh.palm_position)
-                self._right_palm.position = rpos
-                if show_fingers:
-                    for i, fh in enumerate(self._right_fingers):
-                        if i < len(rh.finger_positions):
-                            fh.position = self._leap_to_scene(rh.finger_positions[i])
+                p = rh.palm_position
+                imgui.text(f"Right Palm: ({p[0]:.0f}, {p[1]:.0f}, {p[2]:.0f})")
+            else:
+                imgui.text("Right Palm: --")
 
             if lh.visible:
-                lpos = self._leap_to_scene(lh.palm_position)
-                self._left_palm.position = lpos
-                if show_fingers:
-                    for i, fh in enumerate(self._left_fingers):
-                        if i < len(lh.finger_positions):
-                            fh.position = self._leap_to_scene(lh.finger_positions[i])
+                p = lh.palm_position
+                imgui.text(f"Left Palm: ({p[0]:.0f}, {p[1]:.0f}, {p[2]:.0f})")
+                imgui.text(f"Left Roll: {math.degrees(lh.roll):.1f} deg")
+                imgui.text(f"Left Pitch: {math.degrees(lh.pitch):.1f} deg")
+            else:
+                imgui.text("Left Palm: --")
 
-            # ---- Update GUI readouts ----
-            if gui_due:
-                self._gui_chord.value = snap.chord_type
-                self._gui_base_note.value = midi_to_name(snap.base_note)
-                self._gui_steps.value = snap.step_count
-                self._gui_spread.value = snap.note_spread
+            imgui.separator()
 
-                if rh.visible:
-                    self._gui_right_pos.value = (
-                        f"({rh.palm_position[0]:.0f}, {rh.palm_position[1]:.0f}, {rh.palm_position[2]:.0f})"
-                    )
-                if lh.visible:
-                    self._gui_left_pos.value = (
-                        f"({lh.palm_position[0]:.0f}, {lh.palm_position[1]:.0f}, {lh.palm_position[2]:.0f})"
-                    )
-                    self._gui_left_roll.value = round(math.degrees(lh.roll), 1)
-                    self._gui_left_pitch.value = round(math.degrees(lh.pitch), 1)
+        # Controls help
+        imgui.text_wrapped(
+            "Controls:\n"
+            "- Right hand XYZ -> chord zone\n"
+            "- Left hand height -> base note\n"
+            "- Left hand roll -> step count\n"
+            "- Left hand pitch -> note spread\n"
+            "- Mouse drag -> orbit camera\n"
+            "- Mouse scroll -> zoom"
+        )
 
-                if self._hud_base_note is not None:
-                    self._hud_base_note.text = f"Base: {midi_to_name(snap.base_note)}"
-                self._last_gui_update_time = now
+        imgui.end()
 
-            # ---- Note trail: show a breadcrumb for each arpeggiator step ----
-            if snap.current_step != last_step:
-                last_step = snap.current_step
-                # Place a note indicator near the left hand
-                if show_trail and lh.visible:
-                    trail_pos = self._leap_to_scene(lh.palm_position)
-                    # Offset each note slightly on X based on step
-                    offset_x = (snap.current_step - snap.step_count / 2) * 0.12
-                    idx = note_trail_idx % len(self._note_trail)
-                    self._note_trail[idx].position = (
-                        trail_pos[0] + offset_x,
-                        trail_pos[1] - 0.3,
-                        trail_pos[2],
-                    )
-                    self._note_trail[idx].opacity = 0.9
-                    self._note_trail[idx].color = CHORD_COLORS[snap.chord_zone_layer][snap.chord_zone_row][snap.chord_zone_col]
-                    note_trail_idx += 1
+        imgui.render()
+        self.imgui_renderer.render(imgui.get_draw_data())
 
-                if gui_due:
-                    self._gui_current_note.value = midi_to_name(snap.current_note)
-
-            # Fade old trail notes
-            if show_trail:
-                for i, nh in enumerate(self._note_trail):
-                    age = (note_trail_idx - i) % len(self._note_trail)
-                    if age > 0:
-                        fade = max(0.0, 0.9 - age * 0.09)
-                        nh.opacity = fade
-
-            fps = max(10, int(self._gui_fps.value))
-            time.sleep(1.0 / fps)
+    def resize(self, width, height):
+        self.window_size = (width, height)
+        self.ctx.viewport = (0, 0, width, height)
