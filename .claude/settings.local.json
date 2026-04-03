@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.\\(py|txt|toml|cfg|json|md\\)$\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from shared_state import SharedState; from visualizer import ArpeggiatorVisualizer; print\\('Visualizer loaded OK'\\)\")",
+      "Bash(timeout 8 python main.py)",
+      "Bash(timeout 6 python main.py)",
+      "Bash(python -c \"import sounddevice; print\\('sounddevice OK'\\)\")",
+      "Bash(python -c \"import pyaudio; print\\('pyaudio OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"from arpeggiator import ArpeggiatorEngine; print\\('Arpeggiator import OK'\\)\")",
+      "Bash(timeout 5 python main.py)"
+    ]
+  }
+}
