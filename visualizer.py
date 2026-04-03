@@ -85,6 +85,7 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         self.gui_show_fingers = False
         self.gui_show_trail = False
         self.gui_zone_opacity = 0.08
+        self.gui_synth_enabled = False
 
         # Note trail tracking
         self._trail_positions = []  # list of (glm.vec3, color_tuple, age_counter)
@@ -397,6 +398,7 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             bpm=float(self.gui_bpm),
             note_min=note_min,
             note_max=note_max,
+            synth_enabled=self.gui_synth_enabled,
         )
 
     def _render_imgui(self, snap, view, proj):
@@ -504,6 +506,10 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             changed, val = imgui.checkbox("Show Note Trail", self.gui_show_trail)
             if changed:
                 self.gui_show_trail = val
+
+            changed, val = imgui.checkbox("Sine Synth", self.gui_synth_enabled)
+            if changed:
+                self.gui_synth_enabled = val
 
             imgui.separator()
 

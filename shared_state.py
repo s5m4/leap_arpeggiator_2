@@ -122,6 +122,7 @@ class MusicalState:
     current_note: int = 60
     is_playing: bool = True
     bpm: float = 120.0
+    synth_enabled: bool = False
 
     # Raw hand data for visualization
     right_hand: HandData = field(default_factory=HandData)

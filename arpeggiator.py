@@ -12,6 +12,7 @@ import threading
 import time
 
 from shared_state import SharedState, midi_to_name
+from synth import SineSynth
 
 
 class ArpeggiatorEngine:
@@ -29,6 +30,7 @@ class ArpeggiatorEngine:
         self._running = False
         self._thread = None
         self._midi_out = None
+        self._synth = SineSynth()
 
     def start(self):
         # ---- Optional: real MIDI output ----
@@ -46,6 +48,8 @@ class ArpeggiatorEngine:
         #     print("  No python-rtmidi found. Running without MIDI output.")
         #     self._midi_out = None
 
+        self._synth.start()
+
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -54,6 +58,7 @@ class ArpeggiatorEngine:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
+        self._synth.stop()
         # if self._midi_out:
         #     self._midi_out.close_port()
 
@@ -83,23 +88,34 @@ class ArpeggiatorEngine:
         return notes
 
     def _send_note_on(self, note: int, velocity: int = 100):
-        """Send MIDI note on."""
+        """Send MIDI note on + sine synth."""
         if self._midi_out:
             self._midi_out.send_message([0x90, note, velocity])
+        if self._synth_enabled:
+            self._synth.note_on(note)
 
     def _send_note_off(self, note: int):
-        """Send MIDI note off."""
+        """Send MIDI note off + sine synth."""
         if self._midi_out:
             self._midi_out.send_message([0x80, note, 0])
+        if self._synth_enabled:
+            self._synth.note_off()
 
     def _loop(self):
         """Main arpeggiator loop with drift-compensated timing."""
         step = 0
         last_note = -1
+        self._synth_enabled = False
 
         while self._running:
             snap = self.state.read()
             bpm = snap.bpm
+
+            # Check synth toggle
+            if snap.synth_enabled != self._synth_enabled:
+                self._synth_enabled = snap.synth_enabled
+                if not self._synth_enabled:
+                    self._synth.note_off()
             step_duration = 60.0 / bpm / 2  # 8th notes
 
             # Build current arpeggio
