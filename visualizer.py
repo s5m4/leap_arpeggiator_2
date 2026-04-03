@@ -11,6 +11,7 @@ Renders:
     - A "note trail" showing recently played notes
 """
 
+import sys
 import math
 import numpy as np
 import glm
@@ -39,7 +40,14 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
     @classmethod
     def run(cls, state: SharedState, port: int = 8080):
         cls._shared_state = state
-        moderngl_window.run_window_config(cls, args=[])
+        # Strip custom args before moderngl_window parses sys.argv
+        # (its parse_args falls back to sys.argv[1:] when args is falsy)
+        original_argv = sys.argv
+        sys.argv = [sys.argv[0]]
+        try:
+            moderngl_window.run_window_config(cls)
+        finally:
+            sys.argv = original_argv
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -164,10 +172,16 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         z = pos[2] * 3.0 / 300.0
         return glm.vec3(x, y, z)
 
+    @staticmethod
+    def _glm_to_bytes(m):
+        """Convert glm.mat4 to column-major bytes for OpenGL uniforms.
+        PyGLM's bytes() gives row-major order; OpenGL expects column-major."""
+        return bytes(glm.transpose(m))
+
     def _draw_mesh(self, vao, model, color, opacity, view, proj, eye):
-        self.mesh_prog["u_model"].write(bytes(model))
-        self.mesh_prog["u_view"].write(bytes(view))
-        self.mesh_prog["u_proj"].write(bytes(proj))
+        self.mesh_prog["u_model"].write(self._glm_to_bytes(model))
+        self.mesh_prog["u_view"].write(self._glm_to_bytes(view))
+        self.mesh_prog["u_proj"].write(self._glm_to_bytes(proj))
         self.mesh_prog["u_color"].value = tuple(color)
         self.mesh_prog["u_opacity"].value = opacity
         self.mesh_prog["u_light_dir"].value = (0.5, 1.0, 0.3)
@@ -175,8 +189,8 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         vao.render(moderngl.TRIANGLES)
 
     def _draw_lines(self, vao, count, color, opacity, view, proj):
-        self.line_prog["u_view"].write(bytes(view))
-        self.line_prog["u_proj"].write(bytes(proj))
+        self.line_prog["u_view"].write(self._glm_to_bytes(view))
+        self.line_prog["u_proj"].write(self._glm_to_bytes(proj))
         self.line_prog["u_color"].value = tuple(color)
         self.line_prog["u_opacity"].value = opacity
         vao.render(moderngl.LINES, vertices=count)
@@ -207,23 +221,30 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         proj = self._proj_matrix()
         eye = self._eye_position()
 
-        # Draw grid floor at Y=-2.0
+        # --- Pass 1: opaque / near-opaque geometry (depth write ON) ---
+
+        # Grid floor at Y=-2.0
         grid_view = glm.translate(view, glm.vec3(0.0, -2.0, 0.0))
-        self.line_prog["u_view"].write(bytes(grid_view))
-        self.line_prog["u_proj"].write(bytes(proj))
+        self.line_prog["u_view"].write(self._glm_to_bytes(grid_view))
+        self.line_prog["u_proj"].write(self._glm_to_bytes(proj))
         self.line_prog["u_color"].value = (0.3, 0.3, 0.35)
         self.line_prog["u_opacity"].value = 0.4
         self.grid_vao.render(moderngl.LINES, vertices=self.grid_vertex_count)
 
-        # Render chord cube
-        self._render_chord_cube(snap, view, proj, eye)
-
-        # Render hands
+        # Hands (opacity 0.9 — render before transparent cubes)
         self._render_hands(snap, view, proj, eye)
 
-        # Render note trail
+        # --- Pass 2: transparent geometry (depth write OFF) ---
+        self.ctx.depth_mask = False
+
+        # Chord cubes (opacity 0.08–0.7)
+        self._render_chord_cube(snap, view, proj, eye)
+
+        # Note trail
         if self.gui_show_trail:
             self._render_note_trail(snap, view, proj, eye)
+
+        self.ctx.depth_mask = True
 
         # Sync GUI controls to shared state
         self._sync_gui_to_state(snap)
