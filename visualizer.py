@@ -27,6 +27,210 @@ from shared_state import (
     midi_to_name, chord_name_from_root,
 )
 
+# ---------------------------------------------------------------------------
+# Shader sources
+# ---------------------------------------------------------------------------
+
+VERT_SHADER = """
+#version 330 core
+in vec3 in_position;
+in vec3 in_normal;
+
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_proj;
+
+out vec3 v_normal;
+
+void main() {
+    vec4 world = u_model * vec4(in_position, 1.0);
+    v_normal = mat3(transpose(inverse(u_model))) * in_normal;
+    gl_Position = u_proj * u_view * world;
+}
+"""
+
+FRAG_SHADER = """
+#version 330 core
+in vec3 v_normal;
+
+uniform vec4 u_color;
+uniform vec3 u_light_dir;
+
+out vec4 frag_color;
+
+void main() {
+    vec3 n = normalize(v_normal);
+    vec3 l = normalize(-u_light_dir);
+    float diff = max(dot(n, l), 0.0);
+    float ambient = 0.35;
+    float light = ambient + diff * 0.65;
+    frag_color = vec4(u_color.rgb * light, u_color.a);
+}
+"""
+
+GRID_VERT = """
+#version 330 core
+in vec3 in_position;
+uniform mat4 u_view;
+uniform mat4 u_proj;
+void main() {
+    gl_Position = u_proj * u_view * vec4(in_position, 1.0);
+}
+"""
+
+GRID_FRAG = """
+#version 330 core
+uniform vec4 u_color;
+out vec4 frag_color;
+void main() {
+    frag_color = u_color;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Mesh generators
+# ---------------------------------------------------------------------------
+
+def _make_cube_mesh():
+    """Unit cube centered at origin, 36 verts with normals."""
+    # 6 faces, 2 triangles each
+    V = np.array([
+        # front (+Z)
+        [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5], [ 0.5,  0.5,  0.5],
+        [-0.5, -0.5,  0.5], [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+        # back (-Z)
+        [ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5,  0.5, -0.5],
+        [ 0.5, -0.5, -0.5], [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5],
+        # right (+X)
+        [ 0.5, -0.5,  0.5], [ 0.5, -0.5, -0.5], [ 0.5,  0.5, -0.5],
+        [ 0.5, -0.5,  0.5], [ 0.5,  0.5, -0.5], [ 0.5,  0.5,  0.5],
+        # left (-X)
+        [-0.5, -0.5, -0.5], [-0.5, -0.5,  0.5], [-0.5,  0.5,  0.5],
+        [-0.5, -0.5, -0.5], [-0.5,  0.5,  0.5], [-0.5,  0.5, -0.5],
+        # top (+Y)
+        [-0.5,  0.5,  0.5], [ 0.5,  0.5,  0.5], [ 0.5,  0.5, -0.5],
+        [-0.5,  0.5,  0.5], [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],
+        # bottom (-Y)
+        [-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5], [ 0.5, -0.5,  0.5],
+        [-0.5, -0.5, -0.5], [ 0.5, -0.5,  0.5], [-0.5, -0.5,  0.5],
+    ], dtype='f4')
+
+    N = np.array([
+        *([[0,0,1]]*6),
+        *([[0,0,-1]]*6),
+        *([[1,0,0]]*6),
+        *([[-1,0,0]]*6),
+        *([[0,1,0]]*6),
+        *([[0,-1,0]]*6),
+    ], dtype='f4')
+
+    return np.hstack([V, N])
+
+
+def _make_sphere_mesh(stacks=12, slices=16):
+    """UV sphere centered at origin, radius 1.0."""
+    verts = []
+    for i in range(stacks):
+        phi0 = math.pi * i / stacks
+        phi1 = math.pi * (i + 1) / stacks
+        for j in range(slices):
+            theta0 = 2.0 * math.pi * j / slices
+            theta1 = 2.0 * math.pi * (j + 1) / slices
+
+            # 4 corners of the quad
+            p00 = _sphere_point(phi0, theta0)
+            p10 = _sphere_point(phi1, theta0)
+            p11 = _sphere_point(phi1, theta1)
+            p01 = _sphere_point(phi0, theta1)
+
+            # 2 triangles
+            for p in [p00, p10, p11, p00, p11, p01]:
+                verts.append(list(p) + list(p))  # position = normal for unit sphere
+
+    return np.array(verts, dtype='f4')
+
+
+def _sphere_point(phi, theta):
+    sp = math.sin(phi)
+    return (sp * math.cos(theta), math.cos(phi), sp * math.sin(theta))
+
+
+def _make_grid_lines(size=8.0, divisions=8):
+    """Floor grid at Y=-2.0 using GL_LINES."""
+    lines = []
+    half = size / 2.0
+    step = size / divisions
+    y = -2.0
+    for i in range(divisions + 1):
+        t = -half + i * step
+        lines.append([t, y, -half])
+        lines.append([t, y,  half])
+        lines.append([-half, y, t])
+        lines.append([ half, y, t])
+    return np.array(lines, dtype='f4')
+
+
+# ---------------------------------------------------------------------------
+# Matrix math (pure numpy, no pyrr/glm)
+# ---------------------------------------------------------------------------
+
+def _look_at(eye, target, up):
+    f = target - eye
+    f = f / np.linalg.norm(f)
+    s = np.cross(f, up)
+    s = s / np.linalg.norm(s)
+    u = np.cross(s, f)
+    m = np.eye(4, dtype='f4')
+    m[0, :3] = s
+    m[1, :3] = u
+    m[2, :3] = -f
+    m[3, :3] = 0
+    m[0, 3] = -np.dot(s, eye)
+    m[1, 3] = -np.dot(u, eye)
+    m[2, 3] = np.dot(f, eye)
+    return m
+
+
+def _perspective(fov_deg, aspect, near, far):
+    f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
+    m = np.zeros((4, 4), dtype='f4')
+    m[0, 0] = f / aspect
+    m[1, 1] = f
+    m[2, 2] = (far + near) / (near - far)
+    m[2, 3] = (2 * far * near) / (near - far)
+    m[3, 2] = -1.0
+    return m
+
+
+def _model_matrix(tx=0, ty=0, tz=0, sx=1, sy=1, sz=1):
+    m = np.eye(4, dtype='f4')
+    m[0, 0] = sx
+    m[1, 1] = sy
+    m[2, 2] = sz
+    m[0, 3] = tx
+    m[1, 3] = ty
+    m[2, 3] = tz
+    return m
+
+
+def _project_to_screen(pos_3d, view, proj, width, height):
+    """Project a 3D world position to 2D screen coordinates."""
+    p = np.array([*pos_3d, 1.0], dtype='f4')
+    clip = proj @ view @ p
+    if abs(clip[3]) < 1e-6:
+        return None
+    ndc = clip[:3] / clip[3]
+    if ndc[2] < -1 or ndc[2] > 1:
+        return None
+    sx = (ndc[0] * 0.5 + 0.5) * width
+    sy = (1.0 - (ndc[1] * 0.5 + 0.5)) * height
+    return (sx, sy)
+
+
+# ---------------------------------------------------------------------------
+# Visualizer class
+# ---------------------------------------------------------------------------
 
 class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
     gl_version = (3, 3)
