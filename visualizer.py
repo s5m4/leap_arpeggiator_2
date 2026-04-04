@@ -536,42 +536,21 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
                         view, proj, eye,
                     )
 
-        if lh.visible:
-            lpos = self._leap_to_scene(lh.palm_position)
-            model = glm.translate(glm.mat4(1.0), lpos)
-            model = glm.scale(model, glm.vec3(0.15))
-            self._draw_mesh(
-                self.sphere_vao, model,
-                glm.vec3(0.24, 0.55, 1.0), 0.9,
-                view, proj, eye,
-            )
-
-            if self.gui_show_fingers:
-                for i, fpos in enumerate(lh.finger_positions):
-                    fp = self._leap_to_scene(fpos)
-                    fmodel = glm.translate(glm.mat4(1.0), fp)
-                    fmodel = glm.scale(fmodel, glm.vec3(0.06))
-                    self._draw_mesh(
-                        self.sphere_vao, fmodel,
-                        glm.vec3(0.47, 0.67, 1.0), 0.85,
-                        view, proj, eye,
-                    )
+        # Left hand is rendered as 2D overlays (see _render_left_hand_overlay
+        # and _render_note_bar), not as a 3D object in the scene.
 
     def _render_note_trail(self, snap, view, proj, eye):
-        lh = snap.left_hand
-
         # Detect step change and add new trail position
         if snap.current_step != self._last_step:
             self._last_step = snap.current_step
-            if lh.visible:
-                base_pos = self._leap_to_scene(lh.palm_position)
-                offset_x = (snap.current_step - snap.step_count / 2.0) * 0.12
-                trail_pos = glm.vec3(base_pos.x + offset_x, base_pos.y - 0.3, base_pos.z)
-                color_rgb = CHORD_COLORS[snap.chord_zone_layer][snap.chord_zone_row][snap.chord_zone_col]
-                color = glm.vec3(color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0)
-                self._trail_positions.append((trail_pos, color))
-                if len(self._trail_positions) > self._trail_max:
-                    self._trail_positions.pop(0)
+            # Anchor trail below the chord cube at a fixed position
+            offset_x = (snap.current_step - snap.step_count / 2.0) * 0.12
+            trail_pos = glm.vec3(offset_x, -1.8, 0.0)
+            color_rgb = CHORD_COLORS[snap.chord_zone_layer][snap.chord_zone_row][snap.chord_zone_col]
+            color = glm.vec3(color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0)
+            self._trail_positions.append((trail_pos, color))
+            if len(self._trail_positions) > self._trail_max:
+                self._trail_positions.pop(0)
 
         # Render trail spheres with fading
         total = len(self._trail_positions)
@@ -583,6 +562,122 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             model = glm.translate(glm.mat4(1.0), pos)
             model = glm.scale(model, glm.vec3(0.04))
             self._draw_mesh(self.sphere_vao, model, color, fade, view, proj, eye)
+
+    def _render_left_hand_overlay(self, snap, draw_list):
+        """Draw a simplified left hand in the lower-left corner of the screen."""
+        lh = snap.left_hand
+        if not lh.visible:
+            return
+
+        w, h = self.window_size
+        # Overlay area: lower-left corner
+        box_x = 20
+        box_y = h - 200
+        box_w = 160
+        box_h = 180
+
+        # Background panel
+        bg_col = imgui.get_color_u32_rgba(0.1, 0.1, 0.15, 0.7)
+        draw_list.add_rect_filled(box_x, box_y, box_x + box_w, box_y + box_h, bg_col, 6.0)
+        border_col = imgui.get_color_u32_rgba(0.3, 0.4, 0.6, 0.6)
+        draw_list.add_rect(box_x, box_y, box_x + box_w, box_y + box_h, border_col, 6.0)
+
+        # Label
+        label_col = imgui.get_color_u32_rgba(0.6, 0.7, 0.9, 0.8)
+        draw_list.add_text(box_x + 4, box_y + 2, label_col, "Left Hand")
+
+        # Center of the display area (below label)
+        cx = box_x + box_w / 2
+        cy = box_y + 20 + (box_h - 20) / 2
+
+        # Map palm and finger positions to the overlay space.
+        # Use palm as the reference origin; show fingers relative to palm.
+        palm = lh.palm_position  # [x, y, z]
+        scale = 0.3  # pixels per mm
+
+        # Draw palm center
+        palm_col = imgui.get_color_u32_rgba(0.24, 0.55, 1.0, 0.9)
+        draw_list.add_circle_filled(cx, cy, 8, palm_col, 16)
+
+        # Draw fingers relative to palm
+        finger_col = imgui.get_color_u32_rgba(0.47, 0.67, 1.0, 0.85)
+        line_col = imgui.get_color_u32_rgba(0.35, 0.5, 0.8, 0.5)
+        for fpos in lh.finger_positions:
+            dx = (fpos[0] - palm[0]) * scale
+            dy = -(fpos[1] - palm[1]) * scale  # flip Y (screen Y is down)
+            fx = cx + dx
+            fy = cy + dy
+            # Clamp to box
+            fx = max(box_x + 4, min(box_x + box_w - 4, fx))
+            fy = max(box_y + 22, min(box_y + box_h - 4, fy))
+            draw_list.add_line(cx, cy, fx, fy, line_col, 1.5)
+            draw_list.add_circle_filled(fx, fy, 4, finger_col, 12)
+
+    def _render_note_bar(self, snap, draw_list):
+        """Draw a vertical note bar on the left side showing the active note range."""
+        w, h = self.window_size
+        note_min = snap.note_min
+        note_max = snap.note_max
+        num_notes = note_max - note_min
+        if num_notes <= 0:
+            return
+
+        # Bar dimensions - positioned on the right edge of the screen
+        bar_w = 40
+        bar_x = w - bar_w - 20
+        bar_top = 80
+        bar_bottom = h - 30
+        bar_h = bar_bottom - bar_top
+
+        # Background
+        bg_col = imgui.get_color_u32_rgba(0.1, 0.1, 0.15, 0.7)
+        draw_list.add_rect_filled(bar_x, bar_top, bar_x + bar_w, bar_bottom, bg_col, 4.0)
+        border_col = imgui.get_color_u32_rgba(0.3, 0.4, 0.6, 0.6)
+        draw_list.add_rect(bar_x, bar_top, bar_x + bar_w, bar_bottom, border_col, 4.0)
+
+        # Label
+        label_col = imgui.get_color_u32_rgba(0.6, 0.7, 0.9, 0.8)
+        draw_list.add_text(bar_x + 2, bar_top - 16, label_col, "Notes")
+
+        section_h = bar_h / num_notes
+        active_note = snap.base_note
+
+        for i in range(num_notes):
+            midi_note = note_max - 1 - i  # top = highest note
+            y0 = bar_top + i * section_h
+            y1 = y0 + section_h
+
+            is_active = (midi_note == active_note)
+
+            if is_active:
+                # Highlighted section
+                active_col = imgui.get_color_u32_rgba(0.24, 0.55, 1.0, 0.7)
+                draw_list.add_rect_filled(bar_x + 1, y0, bar_x + bar_w - 1, y1, active_col, 2.0)
+                text_col = imgui.get_color_u32_rgba(1.0, 1.0, 1.0, 1.0)
+            else:
+                text_col = imgui.get_color_u32_rgba(0.5, 0.5, 0.55, 0.7)
+
+            # Separator line
+            sep_col = imgui.get_color_u32_rgba(0.25, 0.25, 0.3, 0.4)
+            draw_list.add_line(bar_x, y1, bar_x + bar_w, y1, sep_col, 1.0)
+
+            # Note name label - show if section is tall enough or if active
+            note_name = midi_to_name(midi_note)
+            if section_h >= 12 or is_active:
+                ty = y0 + (section_h - 10) / 2  # vertically center text
+                draw_list.add_text(bar_x + 3, ty, text_col, note_name)
+            elif midi_note % 12 == 0:
+                # Always show C notes as landmarks
+                ty = y0 + (section_h - 10) / 2
+                draw_list.add_text(bar_x + 3, ty, text_col, note_name)
+
+        # Draw the active note name to the right of the bar for visibility
+        if note_min <= active_note < note_max:
+            idx = note_max - 1 - active_note
+            ay = bar_top + idx * section_h + section_h / 2
+            active_label_col = imgui.get_color_u32_rgba(0.4, 0.7, 1.0, 1.0)
+            draw_list.add_text(bar_x + bar_w + 4, ay - 6, active_label_col,
+                               midi_to_name(active_note))
 
     def _sync_gui_to_state(self, snap):
         note_min = self.gui_note_min
@@ -650,6 +745,10 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
 
                     draw_list.add_text(sx - 10, sy - 6, col_u32, label)
 
+        # --- Left hand 2D overlays ---
+        self._render_left_hand_overlay(snap, draw_list)
+        self._render_note_bar(snap, draw_list)
+
         # HUD label above cube: "Base: C4"
         base_label = f"Base: {midi_to_name(snap.base_note)}"
         hud_sx, hud_sy, hud_vis = self._world_to_screen(
@@ -685,11 +784,13 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             if changed:
                 self.gui_bpm = val
 
-            changed, val = imgui.slider_int("Note Min", self.gui_note_min, 24, 84)
+            imgui.text(f"Note Min: {midi_to_name(self.gui_note_min)}")
+            changed, val = imgui.slider_int("##note_min", self.gui_note_min, 24, 84)
             if changed:
                 self.gui_note_min = val
 
-            changed, val = imgui.slider_int("Note Max", self.gui_note_max, 24, 84)
+            imgui.text(f"Note Max: {midi_to_name(self.gui_note_max)}")
+            changed, val = imgui.slider_int("##note_max", self.gui_note_max, 24, 84)
             if changed:
                 self.gui_note_max = val
 
