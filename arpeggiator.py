@@ -14,6 +14,24 @@ import time
 from shared_state import SharedState, midi_to_name
 from synth import SineSynth
 
+try:
+    import rtmidi
+except ImportError:
+    rtmidi = None
+
+
+MIDI_BACKEND_AVAILABLE = rtmidi is not None
+
+
+def list_midi_output_devices() -> list[str]:
+    if rtmidi is None:
+        return []
+
+    try:
+        return list(rtmidi.MidiOut().get_ports())
+    except Exception:
+        return []
+
 
 class ArpeggiatorEngine:
     """
@@ -30,24 +48,11 @@ class ArpeggiatorEngine:
         self._running = False
         self._thread = None
         self._midi_out = None
+        self._midi_output_device = ""
+        self._midi_send_notes = False
         self._synth = SineSynth()
 
     def start(self):
-        # ---- Optional: real MIDI output ----
-        # try:
-        #     import rtmidi
-        #     self._midi_out = rtmidi.MidiOut()
-        #     # Open a virtual port (macOS/Linux) or first available port (Windows)
-        #     if self._midi_out.get_ports():
-        #         self._midi_out.open_port(0)
-        #         print(f"  MIDI output: {self._midi_out.get_ports()[0]}")
-        #     else:
-        #         self._midi_out.open_virtual_port("LeapArpeggiator")
-        #         print("  MIDI output: virtual port 'LeapArpeggiator'")
-        # except ImportError:
-        #     print("  No python-rtmidi found. Running without MIDI output.")
-        #     self._midi_out = None
-
         self._synth.start()
 
         self._running = True
@@ -59,8 +64,7 @@ class ArpeggiatorEngine:
         if self._thread:
             self._thread.join(timeout=2.0)
         self._synth.stop()
-        # if self._midi_out:
-        #     self._midi_out.close_port()
+        self._close_midi_output()
 
     def _build_arpeggio(self, base_note: int, intervals: list,
                          step_count: int, spread: float) -> list:
@@ -101,6 +105,46 @@ class ArpeggiatorEngine:
         if self._synth_enabled:
             self._synth.note_off()
 
+    def _close_midi_output(self):
+        if self._midi_out:
+            try:
+                self._midi_out.close_port()
+            except Exception:
+                pass
+        self._midi_out = None
+
+    def _sync_midi_output(self, send_notes: bool, device_name: str):
+        if not send_notes or not device_name or rtmidi is None:
+            if self._midi_out is not None:
+                self._close_midi_output()
+            self._midi_output_device = ""
+            self._midi_send_notes = False
+            return
+
+        if send_notes == self._midi_send_notes and device_name == self._midi_output_device and self._midi_out:
+            return
+
+        self._close_midi_output()
+
+        try:
+            midi_out = rtmidi.MidiOut()
+            ports = midi_out.get_ports()
+            for port_index, port_name in enumerate(ports):
+                if port_name == device_name:
+                    midi_out.open_port(port_index)
+                    self._midi_out = midi_out
+                    self._midi_output_device = device_name
+                    self._midi_send_notes = True
+                    print(f"  MIDI output: {device_name}")
+                    return
+
+            print(f"  MIDI output device not found: {device_name}")
+        except Exception as exc:
+            print(f"  Failed to open MIDI output '{device_name}': {exc}")
+
+        self._midi_output_device = ""
+        self._midi_send_notes = False
+
     def _loop(self):
         """Main arpeggiator loop with drift-compensated timing."""
         step = 0
@@ -116,6 +160,12 @@ class ArpeggiatorEngine:
                 self._synth_enabled = snap.synth_enabled
                 if not self._synth_enabled:
                     self._synth.note_off()
+
+            if (
+                snap.midi_send_notes != self._midi_send_notes
+                or snap.midi_output_device != self._midi_output_device
+            ):
+                self._sync_midi_output(snap.midi_send_notes, snap.midi_output_device)
             step_duration = 60.0 / bpm / 2  # 8th notes
 
             # Build current arpeggio

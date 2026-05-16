@@ -3,3 +3,6 @@ moderngl
 moderngl-window[pyglet]
 imgui[pyglet]
 PyGLM
+sounddevice
+setuptools
+python-rtmidi

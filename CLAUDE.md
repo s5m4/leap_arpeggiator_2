@@ -18,7 +18,8 @@
   python main.py --port=9000     # Custom port
   # Opens at http://localhost:8080
 
-  MIDI output requires pip install python-rtmidi and uncommenting rtmidi sections in arpeggiator.py.   
+  MIDI output is available in the visualizer sidebar when python-rtmidi is installed. Select an output
+  device and enable "Send MIDI Notes" to route arpeggiator events to MIDI.
 
   Architecture
 

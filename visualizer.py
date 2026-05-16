@@ -22,6 +22,7 @@ from imgui.integrations.pyglet import PygletProgrammablePipelineRenderer
 
 from shaders import MESH_VERTEX, MESH_FRAGMENT, LINE_VERTEX, LINE_FRAGMENT
 from geometry import make_cube, make_sphere, make_grid, make_wire_cube
+from arpeggiator import list_midi_output_devices, MIDI_BACKEND_AVAILABLE
 from shared_state import (
     SharedState, CHORD_GRID, CHORD_COLORS,
     midi_to_name, chord_name_from_root,
@@ -290,6 +291,9 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         self.gui_show_trail = False
         self.gui_zone_opacity = 0.08
         self.gui_synth_enabled = False
+        self.gui_midi_send_notes = False
+        self.gui_midi_output_device = ""
+        self._midi_output_devices = []
 
         # Note trail tracking
         self._trail_positions = []  # list of (glm.vec3, color_tuple, age_counter)
@@ -416,6 +420,9 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         sx = (ndc.x * 0.5 + 0.5) * w
         sy = (1.0 - (ndc.y * 0.5 + 0.5)) * h
         return sx, sy, True
+
+    def on_render(self, time_val, frametime):
+        self.render(time_val, frametime)
 
     def render(self, time_val, frametime):
         self.ctx.clear(0.08, 0.08, 0.12, 1.0)
@@ -622,9 +629,11 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
         if num_notes <= 0:
             return
 
-        # Bar dimensions - positioned on the right edge of the screen
+        # Bar dimensions - positioned just to the right of the settings sidebar
         bar_w = 40
-        bar_x = w - bar_w - 20
+        sidebar_x = 10
+        sidebar_w = 300
+        bar_x = sidebar_x + sidebar_w + 20
         bar_top = 80
         bar_bottom = h - 30
         bar_h = bar_bottom - bar_top
@@ -698,7 +707,15 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             note_min=note_min,
             note_max=note_max,
             synth_enabled=self.gui_synth_enabled,
+            midi_send_notes=self.gui_midi_send_notes,
+            midi_output_device=self.gui_midi_output_device,
         )
+
+    def _refresh_midi_output_devices(self):
+        self._midi_output_devices = list_midi_output_devices()
+        if self.gui_midi_output_device not in self._midi_output_devices:
+            self.gui_midi_output_device = ""
+        return self._midi_output_devices
 
     def _render_imgui(self, snap, view, proj):
         imgui.new_frame()
@@ -773,6 +790,8 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             imgui.text(f"Steps: {snap.step_count}")
             imgui.text(f"Spread: {snap.note_spread:.2f}")
             imgui.text(f"Playing: {midi_to_name(snap.current_note)}")
+            imgui.text(f"MIDI Notes: {'On' if snap.midi_send_notes else 'Off'}")
+            imgui.text(f"MIDI Out: {snap.midi_output_device or 'None'}")
             imgui.separator()
 
         # Settings section
@@ -816,6 +835,31 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             if changed:
                 self.gui_synth_enabled = val
 
+            changed, val = imgui.checkbox("Send MIDI Notes", self.gui_midi_send_notes)
+            if changed:
+                self.gui_midi_send_notes = val
+
+            midi_devices = self._refresh_midi_output_devices()
+            if not MIDI_BACKEND_AVAILABLE:
+                imgui.text_disabled("Install python-rtmidi to enable MIDI output.")
+            elif not midi_devices:
+                imgui.text_disabled("No MIDI output devices found.")
+            else:
+                preview = self.gui_midi_output_device or "None"
+                if imgui.begin_combo("MIDI Output Device", preview):
+                    clicked, _ = imgui.selectable("None", self.gui_midi_output_device == "")
+                    if clicked:
+                        self.gui_midi_output_device = ""
+
+                    for device_name in midi_devices:
+                        selected = device_name == self.gui_midi_output_device
+                        clicked, _ = imgui.selectable(device_name, selected)
+                        if clicked:
+                            self.gui_midi_output_device = device_name
+                        if selected:
+                            imgui.set_item_default_focus()
+                    imgui.end_combo()
+
             imgui.separator()
 
         # Hand Tracking section
@@ -848,6 +892,7 @@ class ArpeggiatorVisualizer(moderngl_window.WindowConfig):
             "- Left hand height -> base note\n"
             "- Left hand roll -> step count\n"
             "- Left hand pitch -> note spread\n"
+            "- MIDI notes -> select device and toggle send notes\n"
             "- Mouse drag -> orbit camera\n"
             "- Mouse scroll -> zoom"
         )
